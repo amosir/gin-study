@@ -45,6 +45,7 @@ var defaultTrustedCIDRs = []*net.IPNet{
 type HandlerFunc func(*Context)
 
 // HandlersChain defines a HandlerFunc slice.
+// NOTE: 路由处理函数链，运行时会根据索引先后顺序依次调用
 type HandlersChain []HandlerFunc
 
 // Last returns the last handler in the chain. i.e. the last handler is the main one.
@@ -180,6 +181,7 @@ var _ IRouter = (*Engine)(nil)
 func New() *Engine {
 	debugPrintWARNINGNew()
 	engine := &Engine{
+		// NOTE: 实例化RouteGroup，路由管理相关(Engine自身也是一个RouterGroup)
 		RouterGroup: RouterGroup{
 			Handlers: nil,
 			basePath: "/",
@@ -196,13 +198,15 @@ func New() *Engine {
 		RemoveExtraSlash:       false,
 		UnescapePathValues:     true,
 		MaxMultipartMemory:     defaultMultipartMemory,
-		trees:                  make(methodTrees, 0, 9),
-		delims:                 render.Delims{Left: "{{", Right: "}}"},
-		secureJSONPrefix:       "while(1);",
-		trustedProxies:         []string{"0.0.0.0/0", "::/0"},
-		trustedCIDRs:           defaultTrustedCIDRs,
+		// NOTE: 负责存储路由和处理方法的映射，采用类似字典树的结构(这里构造了几棵树，每棵树对应一个http请求方法)
+		trees:            make(methodTrees, 0, 9),
+		delims:           render.Delims{Left: "{{", Right: "}}"},
+		secureJSONPrefix: "while(1);",
+		trustedProxies:   []string{"0.0.0.0/0", "::/0"},
+		trustedCIDRs:     defaultTrustedCIDRs,
 	}
 	engine.RouterGroup.engine = engine
+	// NOTE: 基于sync.Pool实现的context池，能够避免context频繁销毁和重建
 	engine.pool.New = func() any {
 		return engine.allocateContext(engine.maxParams)
 	}
@@ -210,6 +214,7 @@ func New() *Engine {
 }
 
 // Default returns an Engine instance with the Logger and Recovery middleware already attached.
+// 方法调用：gin.Default -> gin.New
 func Default() *Engine {
 	debugPrintWARNINGDefault()
 	engine := New()
@@ -218,6 +223,7 @@ func Default() *Engine {
 }
 
 func (engine *Engine) Handler() http.Handler {
+	// TODO: H2C?
 	if !engine.UseH2C {
 		return engine
 	}
@@ -302,6 +308,7 @@ func (engine *Engine) NoMethod(handlers ...HandlerFunc) {
 // included in the handlers chain for every single request. Even 404, 405, static files...
 // For example, this is the right place for a logger or error management middleware.
 func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
+	// NOTE: 将注册的中间件添加到RouterGroup的Handlers处理函数链中
 	engine.RouterGroup.Use(middleware...)
 	engine.rebuild404Handlers()
 	engine.rebuild405Handlers()
@@ -316,6 +323,7 @@ func (engine *Engine) rebuild405Handlers() {
 	engine.allNoMethod = engine.combineHandlers(engine.noMethod)
 }
 
+// NOTE: 添加路由
 func (engine *Engine) addRoute(method, path string, handlers HandlersChain) {
 	assert1(path[0] == '/', "path must begin with '/'")
 	assert1(method != "", "HTTP method can not be empty")
@@ -323,15 +331,19 @@ func (engine *Engine) addRoute(method, path string, handlers HandlersChain) {
 
 	debugPrintRoute(method, path, handlers)
 
+	// 每个请求方法(GET/POST...)都对应一棵前缀树，这里获取当前方法的前缀树
 	root := engine.trees.get(method)
+	// 首次添加此方法的路由，构造前缀树
 	if root == nil {
 		root = new(node)
 		root.fullPath = "/"
 		engine.trees = append(engine.trees, methodTree{method: method, root: root})
 	}
+	// 将路由的绝对路径和对应的完整处理函数链添加到路由树
 	root.addRoute(path, handlers)
 
 	// Update maxParams
+	// 更新最大路径参数数
 	if paramsCount := countParams(path); paramsCount > engine.maxParams {
 		engine.maxParams = paramsCount
 	}
@@ -370,6 +382,7 @@ func iterate(path, method string, routes RoutesInfo, root *node) RoutesInfo {
 // Run attaches the router to a http.Server and starts listening and serving HTTP requests.
 // It is a shortcut for http.ListenAndServe(addr, router)
 // Note: this method will block the calling goroutine indefinitely unless an error happens.
+// NOTE:
 func (engine *Engine) Run(addr ...string) (err error) {
 	defer func() { debugPrintError(err) }()
 
@@ -380,6 +393,7 @@ func (engine *Engine) Run(addr ...string) (err error) {
 
 	address := resolveAddress(addr)
 	debugPrint("Listening and serving HTTP on %s\n", address)
+	// NOTE: 使用的是标准库的http服务启动方法, engine实现了http.Handler方法(即ServeHTTP方法)，所以会被作为net/http 包下Handler接口的实现类，收到请求时，会交给Engine.ServeHTTP方法处理
 	err = http.ListenAndServe(address, engine.Handler())
 	return
 }
@@ -564,14 +578,20 @@ func (engine *Engine) RunListener(listener net.Listener) (err error) {
 }
 
 // ServeHTTP conforms to the http.Handler interface.
+// NOTE: 在服务端接收到 http 请求时，会通过 Handler.ServeHTTP 方法进行处理.
+// NOTE: 而此处的 Handler 正是 gin.Engine，所以会首先在这里进行处理
 func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// 对于每个http请求，会为其分配一个gin.Context，在handlers处理器链中持续向下传递
 	c := engine.pool.Get().(*Context)
+	// 重置context的输出流相关信息，设置默认状态、输出流对象(设置为http的输出流)
 	c.writermem.reset(w)
+	// 将请求对象保存在context中
 	c.Request = req
 	c.reset()
 
+	// 从路由树中获取handlers链并依次调用
 	engine.handleHTTPRequest(c)
-
+	// 处理完毕后将context放回对象池
 	engine.pool.Put(c)
 }
 
@@ -602,18 +622,22 @@ func (engine *Engine) handleHTTPRequest(c *Context) {
 	// Find root of the tree for the given HTTP method
 	t := engine.trees
 	for i, tl := 0, len(t); i < tl; i++ {
+		// 根据http请求方法获取对应的路由树
 		if t[i].method != httpMethod {
 			continue
 		}
 		root := t[i].root
 		// Find route in tree
+		// 根据请求路径获取路由树节点信息，包括处理器链和路径
 		value := root.getValue(rPath, c.params, c.skippedNodes, unescape)
 		if value.params != nil {
 			c.Params = *value.params
 		}
+		// 将处理器链注入到context中
 		if value.handlers != nil {
 			c.handlers = value.handlers
 			c.fullPath = value.fullPath
+			// NOTE: 开启 handlers 链的遍历调用流程
 			c.Next()
 			c.writermem.WriteHeaderNow()
 			return

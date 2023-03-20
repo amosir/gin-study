@@ -48,25 +48,27 @@ const abortIndex int8 = math.MaxInt8 >> 1
 
 // Context is the most important part of gin. It allows us to pass variables between middleware,
 // manage the flow, validate the JSON of a request and render a JSON response for example.
+// NOTE: 对应于一次 http 请求，贯穿于整条 handlersChain 调用链路的上下文
 type Context struct {
 	writermem responseWriter
-	Request   *http.Request
-	Writer    ResponseWriter
+	Request   *http.Request  // http请求
+	Writer    ResponseWriter // http响应输出流
 
 	Params   Params
 	handlers HandlersChain
-	index    int8
+	index    int8 // 当前的处理进度，即处理链路处于函数链的索引位置
 	fullPath string
 
 	engine       *Engine
-	params       *Params
+	params       *Params // URL路径参数
 	skippedNodes *[]skippedNode
 
 	// This mutex protects Keys map.
-	mu sync.RWMutex
+	mu sync.RWMutex // 用于保护 map 的读写互斥锁
 
 	// Keys is a key/value pair exclusively for the context of each request.
-	Keys map[string]any
+	// 提供对外暴露的 Get 和 Set 接口向用户提供了共享数据的存取服务，相关操作都在读写锁的保护之下，能够保证并发安全
+	Keys map[string]any // 缓存 handlers 链上共享数据的 map
 
 	// Errors is a list of errors attached to all the handlers/middlewares who used this context.
 	Errors errorMsgs
@@ -168,6 +170,10 @@ func (c *Context) FullPath() string {
 // Next should be used only inside middleware.
 // It executes the pending handlers in the chain inside the calling handler.
 // See example in GitHub.
+// NOTE: 以Context.index 为索引，通过 for 循环依次调用 handlers 链中的 handler.
+// 由于 Context 本身会暴露于调用链路中，因此用户可以在某个 handler 中通过手动调用 Context.Next 的方式来打断当前 handler 的执行流程，提前进入下一个 handler 的处理中.
+// 由于此时本质上是一个方法压栈调用的行为，因此在后置位 handlers 链全部处理完成后，最终会回到压栈前的位置，执行当前 handler 剩余部分的代码逻辑.
+
 func (c *Context) Next() {
 	c.index++
 	for c.index < int8(len(c.handlers)) {
@@ -185,6 +191,7 @@ func (c *Context) IsAborted() bool {
 // Let's say you have an authorization middleware that validates that the current request is authorized.
 // If the authorization fails (ex: the password does not match), call Abort to ensure the remaining handlers
 // for this request are not called.
+// NOTE: 用户可以在某个 handler 中通过调用 Context.Abort 方法实现 handlers 链路的提前熔断
 func (c *Context) Abort() {
 	c.index = abortIndex
 }
@@ -246,6 +253,7 @@ func (c *Context) Error(err error) *Error {
 
 // Set is used to store a new key/value pair exclusively for this context.
 // It also lazy initializes  c.Keys if it was not used previously.
+// NOTE: 提供对外暴露的接口用于在处理器链中传递数据(通过Context)
 func (c *Context) Set(key string, value any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

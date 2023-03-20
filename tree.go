@@ -49,9 +49,10 @@ func (ps Params) ByName(name string) (va string) {
 	return
 }
 
+// NOTE: 路由树结构
 type methodTree struct {
 	method string
-	root   *node
+	root   *node // 该方法对应的路由树的根节点
 }
 
 type methodTrees []methodTree
@@ -113,24 +114,38 @@ const (
 	catchAll
 )
 
+// NOTE: 前缀树节点
 type node struct {
-	path      string
-	indices   string
+	// 节点路径(不包含父节点)
+	path string
+	// 每个子节点path的首字母拼接的字符串，如search和support，子节点路径为earch和upport，则保存eu
+	indices string
+	// 是否是参数节点
 	wildChild bool
-	nType     nodeType
-	priority  uint32
-	children  []*node // child nodes, at most 1 :param style node at the end of the array
-	handlers  HandlersChain
-	fullPath  string
+	// 节点类型: root(根节点)、static(静态节点)、catchAll(通配符匹配的节点)、param(参数节点)
+	nType nodeType
+	// 当前节点及其子节点上注册的handler数作为其优先级，好处是:
+	// 1. 包含路径越多，越先被评估，可以让包含路由多的节点先被定位
+	// 2. 最长的路径一般需要花费更长的时间来定位，如果最长路径的节点能被优先评估（即每次拿子节点都命中），那么所花时间不一定比短路径的路由长
+	priority uint32
+	// 子节点数组
+	children []*node // child nodes, at most 1 :param style node at the end of the array
+	// 处理函数链
+	handlers HandlersChain
+	// 完整路径(路由树结构中根节点到当前节点的路径上的全部path的完整拼接)
+	fullPath string
 }
 
 // Increments priority of the given child and reorders if necessary
 func (n *node) incrementChildPrio(pos int) int {
+	// 子节点数组
 	cs := n.children
+	// 增加对应的子节点优先级
 	cs[pos].priority++
 	prio := cs[pos].priority
 
 	// Adjust position (move to front)
+	// 调整节点位置，确保整个子节点数组是按照优先级倒序排列的，从而优先级更大的节点会被优先匹配
 	newPos := pos
 	for ; newPos > 0 && cs[newPos-1].priority < prio; newPos-- {
 		// Swap node positions
@@ -138,6 +153,7 @@ func (n *node) incrementChildPrio(pos int) int {
 	}
 
 	// Build new index char string
+	// 调整前缀字符串，确保每个字母和子节点数组路径的首字母一致
 	if newPos != pos {
 		n.indices = n.indices[:newPos] + // Unchanged prefix, might be empty
 			n.indices[pos:pos+1] + // The index char we move
@@ -151,9 +167,11 @@ func (n *node) incrementChildPrio(pos int) int {
 // Not concurrency-safe!
 func (n *node) addRoute(path string, handlers HandlersChain) {
 	fullPath := path
+	// 当前节点每加一条路由，优先级增加1
 	n.priority++
 
 	// Empty tree
+	// 当前节点还没有注册路由且子节点数为0，表明当前节点是根节点且未注册路由，直接插入新路由即可
 	if len(n.path) == 0 && len(n.children) == 0 {
 		n.insertChild(path, fullPath, handlers)
 		n.nType = root
@@ -167,33 +185,44 @@ walk:
 		// Find the longest common prefix.
 		// This also implies that the common prefix contains no ':' or '*'
 		// since the existing key can't contain those chars.
+		// 计算当前节点路径和新注册路径的最长公共前缀字符位置
 		i := longestCommonPrefix(path, n.path)
 
 		// Split edge
+		// 最长公共前缀长度小于新路由长度，表明节点需要分裂
+		// 开始分裂，比如一开始node.path是search，新来了support，s是他们匹配的部分，
+		// 那么会将s拿出来作为parent节点，增加earch和upport作为child节点
 		if i < len(n.path) {
 			child := node{
+				// 原本父节点路径中不在最长前缀的部分(即原节点的后半部分)作为子节点
 				path:      n.path[i:],
 				wildChild: n.wildChild,
 				nType:     static,
 				indices:   n.indices,
 				children:  n.children,
-				handlers:  n.handlers,
-				priority:  n.priority - 1,
-				fullPath:  n.fullPath,
+				handlers:  n.handlers, // search的处理器链转移给earch
+				// 新路由support注册时，优先级加1了，由于需要降级为子节点，所以要减一
+				priority: n.priority - 1,
+				fullPath: n.fullPath,
 			}
 
+			// 先添加子节点: search -> upport，后续调整为s
 			n.children = []*node{&child}
 			// []byte for proper unicode char conversion, see #65
+			// 设置s的首字母字符串序列为eu
 			n.indices = bytesconv.BytesToString([]byte{n.path[i]})
+			// 原本的父节点路径中公共前缀部分作为父节点路径，即search调整为s
 			n.path = path[:i]
+			// search调整为s，不再是完整路径了，故清空处理器链
 			n.handlers = nil
 			n.wildChild = false
 			n.fullPath = fullPath[:parentFullPathIndex+i]
 		}
 
 		// Make new node a child of this node
+		// 新加的路由中最长公共前缀之外的部分作为新的父节点的子节点，即将新加入的support的upport部分作为s的子节点
 		if i < len(path) {
-			path = path[i:]
+			path = path[i:] // path删除公共前缀部分
 			c := path[0]
 
 			// '/' after param
@@ -205,6 +234,9 @@ walk:
 			}
 
 			// Check if a child with the next path byte exists
+			// 判断子节点中是否有和当前path匹配的，只需要查看子节点path的第一个字母即可
+			// 比如s的子节点是earch和upport，indices为eu
+			// 如果新来的路由是super，则和upport的首字母匹配，需要继续分裂该子节点
 			for i, max := 0, len(n.indices); i < max; i++ {
 				if c == n.indices[i] {
 					parentFullPathIndex += len(n.path)
@@ -215,16 +247,20 @@ walk:
 			}
 
 			// Otherwise insert it
+			// 到这里说明，新的路由中公共前缀之外的部分的首字母，和之前的所有子节点首字母皆不同，也就是说和子节点路径没有公共前缀，直接插入新的节点即可
 			if c != ':' && c != '*' && n.nType != catchAll {
+				// 新的路径是精确匹配路径(首字母不是:和*且当前节点不是通配节点)
 				// []byte for proper unicode char conversion, see #65
 				n.indices += bytesconv.BytesToString([]byte{c})
 				child := &node{
 					fullPath: fullPath,
 				}
+				// 添加到子节点，并更新当前节点的优先级
 				n.addChild(child)
 				n.incrementChildPrio(len(n.indices) - 1)
 				n = child
 			} else if n.wildChild {
+				// 新节点是通配节点*或参数节点:或者当前节点是通配节点
 				// inserting a wildcard node, need to check if it conflicts with the existing wildcard
 				n = n.children[len(n.children)-1]
 				n.priority++
@@ -251,11 +287,13 @@ walk:
 					"'")
 			}
 
+			// 插入子节点
 			n.insertChild(path, fullPath, handlers)
 			return
 		}
 
 		// Otherwise add handle to current node
+		// 到这里说明，新路径与当前节点路径的最长前缀等于当前节点路径，不允许这种路由
 		if n.handlers != nil {
 			panic("handlers are already registered for path '" + fullPath + "'")
 		}
@@ -267,6 +305,7 @@ walk:
 
 // Search for a wildcard segment and check the name for invalid characters.
 // Returns -1 as index, if no wildcard was found.
+// 寻找通配部分，wildcard是路径中[*:]和/之间的部分，i表示:或*的位置，valid表示是否是合法的路径
 func findWildcard(path string) (wildcard string, i int, valid bool) {
 	// Find start
 	for start, c := range []byte(path) {
@@ -290,15 +329,18 @@ func findWildcard(path string) (wildcard string, i int, valid bool) {
 	return "", -1, false
 }
 
+// 这里的path是新路由中去掉前缀之后的部分
 func (n *node) insertChild(path string, fullPath string, handlers HandlersChain) {
 	for {
 		// Find prefix until first wildcard
+		// 寻找路径中的通配符
 		wildcard, i, valid := findWildcard(path)
 		if i < 0 { // No wildcard found
 			break
 		}
 
 		// The wildcard name must only contain one ':' or '*' character
+		// 不合法路径
 		if !valid {
 			panic("only one wildcard per path segment is allowed, has: '" +
 				wildcard + "' in path '" + fullPath + "'")
@@ -309,6 +351,7 @@ func (n *node) insertChild(path string, fullPath string, handlers HandlersChain)
 			panic("wildcards must be named with a non-empty name in path '" + fullPath + "'")
 		}
 
+		// 参数通配
 		if wildcard[0] == ':' { // param
 			if i > 0 {
 				// Insert prefix before the current wildcard
@@ -346,6 +389,7 @@ func (n *node) insertChild(path string, fullPath string, handlers HandlersChain)
 		}
 
 		// catchAll
+		// 只允许在路径最后出现*
 		if i+len(wildcard) != len(path) {
 			panic("catch-all routes are only allowed at the end of the path in path '" + fullPath + "'")
 		}
@@ -393,14 +437,16 @@ func (n *node) insertChild(path string, fullPath string, handlers HandlersChain)
 	}
 
 	// If no wildcard was found, simply insert the path and handle
+	// 普通的路径，直接插入
 	n.path = path
 	n.handlers = handlers
 	n.fullPath = fullPath
 }
 
 // nodeValue holds return values of (*Node).getValue method
+// NOTE: 路由树节点
 type nodeValue struct {
-	handlers HandlersChain
+	handlers HandlersChain // 处理器函数链
 	params   *Params
 	tsr      bool
 	fullPath string
@@ -417,6 +463,7 @@ type skippedNode struct {
 // If no handle can be found, a TSR (trailing slash redirect) recommendation is
 // made if a handle exists with an extra (without the) trailing slash for the
 // given path.
+// NOTE: 从路由树中获取path对应的节点
 func (n *node) getValue(path string, params *Params, skippedNodes *[]skippedNode, unescape bool) (value nodeValue) {
 	var globalParamsCount int16
 
@@ -572,9 +619,11 @@ walk: // Outer loop for walking the tree
 			}
 		}
 
+		// path等于node.path，说明已经找到目标
 		if path == prefix {
 			// If the current path does not equal '/' and the node does not have a registered handle and the most recently matched node has a child node
 			// the current node needs to roll back to last valid skippedNode
+			// 返回handlers
 			if n.handlers == nil && path != "/" {
 				for length := len(*skippedNodes); length > 0; length-- {
 					skippedNode := (*skippedNodes)[length-1]
@@ -627,6 +676,7 @@ walk: // Outer loop for walking the tree
 
 		// Nothing found. We can recommend to redirect to the same URL with an
 		// extra trailing slash if a leaf exists for that path
+		// path 与 node.path 已经没有公共前缀，说明匹配失败
 		value.tsr = path == "/" ||
 			(len(prefix) == len(path)+1 && prefix[len(path)] == '/' &&
 				path == prefix[:len(prefix)-1] && n.handlers != nil)

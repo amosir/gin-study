@@ -24,6 +24,7 @@ var (
 )
 
 // IRouter defines all router handle interface includes single and group router.
+// NOTE: 路由管理接口，暴露了一系列路由方法，如果想自己实现Engine，需要实现此接口
 type IRouter interface {
 	IRoutes
 	Group(string, ...HandlerFunc) *RouterGroup
@@ -52,11 +53,16 @@ type IRoutes interface {
 
 // RouterGroup is used internally to configure router, a RouterGroup is associated with
 // a prefix and an array of handlers (middleware).
+// NOTE: 路由组结构，其中的配置将被其下所有路由复用
 type RouterGroup struct {
+	// 路由组处理函数链，其下路由的函数链将结合路由组和自身的函数组成最终的函数链
 	Handlers HandlersChain
+	// 路由组的基地址，一般是其下路由的公共地址
 	basePath string
-	engine   *Engine
-	root     bool
+	// 路由组所属的Engine，这里构成了双向引用
+	engine *Engine
+	// 该路由组是否位于根节点，基于RouterGroup.Group创建路由组时此属性为false
+	root bool
 }
 
 var _ IRouter = (*RouterGroup)(nil)
@@ -84,8 +90,11 @@ func (group *RouterGroup) BasePath() string {
 }
 
 func (group *RouterGroup) handle(httpMethod, relativePath string, handlers HandlersChain) IRoutes {
+	// 将路由组的基地址和传入的相对地址组合成绝对路径
 	absolutePath := group.calculateAbsolutePath(relativePath)
+	// 将路由组的处理函数链和当前路由的处理函数组合成完成的处理函数链
 	handlers = group.combineHandlers(handlers)
+	// 将路由及其对应的处理函数链添加到路由树中
 	group.engine.addRoute(httpMethod, absolutePath, handlers)
 	return group.returnObj()
 }
@@ -108,6 +117,8 @@ func (group *RouterGroup) Handle(httpMethod, relativePath string, handlers ...Ha
 }
 
 // POST is a shortcut for router.Handle("POST", path, handlers).
+// NOTE: RouterGroup.POST-> RouterGroup.handle
+// NOTE: 所有的九个方法都最终调用的Router.handle方法，传入三个参数: 请求方法(GET、POST...)、相对路径、处理函数
 func (group *RouterGroup) POST(relativePath string, handlers ...HandlerFunc) IRoutes {
 	return group.handle(http.MethodPost, relativePath, handlers)
 }
@@ -239,10 +250,14 @@ func (group *RouterGroup) createStaticHandler(relativePath string, fs http.FileS
 }
 
 func (group *RouterGroup) combineHandlers(handlers HandlersChain) HandlersChain {
+	// 构造新的切片，其长度为路由组过滤器链长度 + 路由的处理链长度
 	finalSize := len(group.Handlers) + len(handlers)
+	// 这里要求处理器链的长度最大为63，超过此长度注册路由会失败(Abort就是通过设置Index为63来提前中断处理器链的执行的)
 	assert1(finalSize < int(abortIndex), "too many handlers")
 	mergedHandlers := make(HandlersChain, finalSize)
+	// 深拷贝路由组处理器链
 	copy(mergedHandlers, group.Handlers)
+	// 深拷贝路由处理器链
 	copy(mergedHandlers[len(group.Handlers):], handlers)
 	return mergedHandlers
 }

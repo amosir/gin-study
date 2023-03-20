@@ -49,6 +49,7 @@ var (
 )
 
 func init() {
+	// NOTE: 根据环境变量GIN_MODE确定运行模式
 	mode := os.Getenv(EnvGinMode)
 	SetMode(mode)
 }

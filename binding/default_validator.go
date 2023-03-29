@@ -92,6 +92,6 @@ func (v *defaultValidator) Engine() any {
 func (v *defaultValidator) lazyinit() {
 	v.once.Do(func() {
 		v.validate = validator.New()
-		v.validate.SetTagName("binding")
+		v.validate.SetTagName("binding") // 使用了validator库进行字段校验，只不过定制了tag，不使用默认的validate标签
 	})
 }

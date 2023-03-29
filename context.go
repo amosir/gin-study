@@ -54,13 +54,13 @@ type Context struct {
 	Request   *http.Request  // http请求
 	Writer    ResponseWriter // http响应输出流
 
-	Params   Params
+	Params   Params // URL路径参数
 	handlers HandlersChain
 	index    int8 // 当前的处理进度，即处理链路处于函数链的索引位置
 	fullPath string
 
 	engine       *Engine
-	params       *Params // URL路径参数
+	params       *Params
 	skippedNodes *[]skippedNode
 
 	// This mutex protects Keys map.
@@ -68,7 +68,7 @@ type Context struct {
 
 	// Keys is a key/value pair exclusively for the context of each request.
 	// 提供对外暴露的 Get 和 Set 接口向用户提供了共享数据的存取服务，相关操作都在读写锁的保护之下，能够保证并发安全
-	Keys map[string]any // 缓存 handlers 链上共享数据的 map
+	Keys map[string]any // 缓存 handlers 链上共享数据的 map，由于使用的map，避免了设置多个值时context形成链表
 
 	// Errors is a list of errors attached to all the handlers/middlewares who used this context.
 	Errors errorMsgs
@@ -77,11 +77,11 @@ type Context struct {
 	Accepted []string
 
 	// queryCache caches the query result from c.Request.URL.Query().
-	queryCache url.Values
+	queryCache url.Values // 查询参数缓存，使用时调用`Request.URL.Query()`，该方法每次都会对原始的查询字符串进行解析，所以这里设置缓存避免冗余的解析操作
 
 	// formCache caches c.Request.PostForm, which contains the parsed form data from POST, PATCH,
 	// or PUT body parameters.
-	formCache url.Values
+	formCache url.Values // 表单参数缓存，作用同上
 
 	// SameSite allows a server to define a cookie attribute making it impossible for
 	// the browser to send this cookie along with cross-site requests.
@@ -198,6 +198,7 @@ func (c *Context) Abort() {
 
 // AbortWithStatus calls `Abort()` and writes the headers with the specified status code.
 // For example, a failed attempt to authenticate a request could use: context.AbortWithStatus(401).
+// NOTE: 熔断处理器链并设置http响应，如设置状态码、错误、响应体
 func (c *Context) AbortWithStatus(code int) {
 	c.Status(code)
 	c.Writer.WriteHeaderNow()
@@ -229,6 +230,7 @@ func (c *Context) AbortWithError(code int, err error) *Error {
 // A middleware can be used to collect all the errors and push them to a database together,
 // print a log, or append it in the HTTP response.
 // Error will panic if err is nil.
+// NOTE: 将error收集到context中
 func (c *Context) Error(err error) *Error {
 	if err == nil {
 		panic("err is nil")
@@ -398,6 +400,8 @@ func (c *Context) GetStringMapStringSlice(key string) (smss map[string][]string)
 //	    // a GET request to /user/john/
 //	    id := c.Param("id") // id == "/john/"
 //	})
+//
+// NOTE: 获取请求路径中的参数
 func (c *Context) Param(key string) string {
 	return c.Params.ByName(key)
 }
@@ -420,6 +424,8 @@ func (c *Context) AddParam(key, value string) {
 //		   c.Query("name") == "Manu"
 //		   c.Query("value") == ""
 //		   c.Query("wtf") == ""
+//
+// NOTE: 获取查询参数
 func (c *Context) Query(key string) (value string) {
 	value, _ = c.GetQuery(key)
 	return
@@ -496,6 +502,7 @@ func (c *Context) GetQueryMap(key string) (map[string]string, bool) {
 
 // PostForm returns the specified key from a POST urlencoded form or multipart form
 // when it exists, otherwise it returns an empty string `("")`.
+// NOTE: 获取表单参数
 func (c *Context) PostForm(key string) (value string) {
 	value, _ = c.GetPostForm(key)
 	return
@@ -533,10 +540,12 @@ func (c *Context) PostFormArray(key string) (values []string) {
 	return
 }
 
+// NOTE: 初始化表单参数缓存
 func (c *Context) initFormCache() {
 	if c.formCache == nil {
 		c.formCache = make(url.Values)
 		req := c.Request
+		// 从这里可以看出，如果不使用缓存，则每次都会解析请求，效率较低
 		if err := req.ParseMultipartForm(c.engine.MaxMultipartMemory); err != nil {
 			if !errors.Is(err, http.ErrNotMultipart) {
 				debugPrint("error on parse multipart form array: %v", err)
@@ -583,6 +592,7 @@ func (c *Context) get(m map[string][]string, key string) (map[string]string, boo
 }
 
 // FormFile returns the first file for the provided form key.
+// NOTE: 获取通过表单上传的文件信息
 func (c *Context) FormFile(name string) (*multipart.FileHeader, error) {
 	if c.Request.MultipartForm == nil {
 		if err := c.Request.ParseMultipartForm(c.engine.MaxMultipartMemory); err != nil {
@@ -604,6 +614,7 @@ func (c *Context) MultipartForm() (*multipart.Form, error) {
 }
 
 // SaveUploadedFile uploads the form file to specific dst.
+// NOTE: 保存上传的文件
 func (c *Context) SaveUploadedFile(file *multipart.FileHeader, dst string) error {
 	src, err := file.Open()
 	if err != nil {
@@ -859,6 +870,7 @@ func bodyAllowedForStatus(status int) bool {
 }
 
 // Status sets the HTTP response code.
+// NOTE: 设置状态码
 func (c *Context) Status(code int) {
 	c.Writer.WriteHeader(code)
 }
@@ -866,6 +878,7 @@ func (c *Context) Status(code int) {
 // Header is an intelligent shortcut for c.Writer.Header().Set(key, value).
 // It writes a header in the response.
 // If value == "", this method removes the header `c.Writer.Header().Del(key)`
+// NOTE: 设置响应头
 func (c *Context) Header(key, value string) {
 	if value == "" {
 		c.Writer.Header().Del(key)
@@ -880,6 +893,7 @@ func (c *Context) GetHeader(key string) string {
 }
 
 // GetRawData returns stream data.
+// NOTE: 读取原始请求体数据
 func (c *Context) GetRawData() ([]byte, error) {
 	return io.ReadAll(c.Request.Body)
 }
@@ -892,6 +906,7 @@ func (c *Context) SetSameSite(samesite http.SameSite) {
 // SetCookie adds a Set-Cookie header to the ResponseWriter's headers.
 // The provided cookie must have a valid Name. Invalid cookies may be
 // silently dropped.
+
 func (c *Context) SetCookie(name, value string, maxAge int, path, domain string, secure, httpOnly bool) {
 	if path == "" {
 		path = "/"
@@ -922,6 +937,11 @@ func (c *Context) Cookie(name string) (string, error) {
 }
 
 // Render writes the response headers and calls render.Render to render data.
+// NOTE: 使用传入的Render对响应内容进行渲染
+// 主要做了三件事:
+// 1. 设置状态码
+// 2. 判断是否需要写入响应体内容
+// 3. 使用指定的Render实现进行Render，实际上是设置响应的Content-Type以及按照指定方式对响应内容进行序列化
 func (c *Context) Render(code int, r render.Render) {
 	c.Status(code)
 
@@ -1018,6 +1038,7 @@ func (c *Context) String(code int, format string, values ...any) {
 }
 
 // Redirect returns an HTTP redirect to the specific location.
+// 重定向
 func (c *Context) Redirect(code int, location string) {
 	c.Render(-1, render.Redirect{
 		Code:     code,
